@@ -4,7 +4,10 @@ import atexit
 import ctypes
 import io
 import sys
+import threading
+import tkinter as tk
 from ctypes import wintypes
+from tkinter import ttk
 
 import mss
 import websockets
@@ -19,10 +22,13 @@ user32 = ctypes.windll.user32
 user32.SetProcessDPIAware()
 
 VK_OEM_3 = 0xC0  # backtick / tilde key on US layouts
+VK_LBUTTON = 0x01
 SC_F2 = 0x3C
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 INPUT_KEYBOARD = 1
+IDC_ARROW = 32512
+DEFAULT_CURSOR_HANDLE = ctypes.windll.user32.LoadCursorW(0, IDC_ARROW)
 _f2_held = False
 
 
@@ -104,10 +110,27 @@ class POINT(ctypes.Structure):
     _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
 
 
+class CURSORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hCursor", wintypes.HANDLE),
+        ("ptScreenPos", POINT),
+    ]
+
+
 def get_cursor_position() -> tuple[int, int]:
     pt = POINT()
     user32.GetCursorPos(ctypes.byref(pt))
     return pt.x, pt.y
+
+
+def is_default_cursor() -> bool:
+    info = CURSORINFO()
+    info.cbSize = ctypes.sizeof(info)
+    if not user32.GetCursorInfo(ctypes.byref(info)):
+        return True
+    return info.hCursor == DEFAULT_CURSOR_HANDLE
 
 
 def get_screen_size() -> tuple[int, int]:
@@ -137,7 +160,11 @@ async def cursor_loop(ws) -> None:
         if _f2_held and tick % F2_REFRESH_EVERY == 0:
             _send_scancode(SC_F2, key_up=False)
         x, y = get_cursor_position()
-        await ws.send(encode_position(x / width, y / height))
+        await ws.send(encode_position(
+            x / width, y / height,
+            is_default_cursor(),
+            is_key_down(VK_LBUTTON),
+        ))
         await asyncio.sleep(interval)
         tick += 1
 
@@ -151,29 +178,31 @@ def _capture_jpeg(monitor: dict, quality: int) -> bytes:
         return buf.getvalue()
 
 
-async def image_loop(ws, src_rect, dest_rect, fps: int, quality: int) -> None:
+async def image_loop(ws, get_region, fps: int, quality: int) -> None:
     interval = 1.0 / fps
-    monitor = {
-        "left": src_rect[0], "top": src_rect[1],
-        "width": src_rect[2], "height": src_rect[3],
-    }
     loop = asyncio.get_event_loop()
     while True:
-        jpeg = await loop.run_in_executor(None, _capture_jpeg, monitor, quality)
-        await ws.send(encode_image(jpeg, dest_rect))
+        region = get_region()
+        if region is not None:
+            monitor = {
+                "left": region[0], "top": region[1],
+                "width": region[2], "height": region[3],
+            }
+            jpeg = await loop.run_in_executor(None, _capture_jpeg, monitor, quality)
+            await ws.send(encode_image(jpeg))
         await asyncio.sleep(interval)
 
 
-async def run(uri: str, src_rect, dest_rect, fps: int, quality: int) -> None:
+async def run_session(uri: str, get_region, fps: int, quality: int, on_status) -> None:
     while True:
         try:
+            on_status(f"connecting to {uri}…")
             async with websockets.connect(uri, max_size=None) as ws:
-                print(f"connected to {uri}", file=sys.stderr, flush=True)
-                tasks = [asyncio.create_task(cursor_loop(ws))]
-                if src_rect is not None and dest_rect is not None:
-                    tasks.append(asyncio.create_task(
-                        image_loop(ws, src_rect, dest_rect, fps, quality)
-                    ))
+                on_status(f"connected to {uri}")
+                tasks = [
+                    asyncio.create_task(cursor_loop(ws)),
+                    asyncio.create_task(image_loop(ws, get_region, fps, quality)),
+                ]
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_EXCEPTION
                 )
@@ -181,52 +210,208 @@ async def run(uri: str, src_rect, dest_rect, fps: int, quality: int) -> None:
                     t.cancel()
                 for t in done:
                     t.result()
+        except asyncio.CancelledError:
+            on_status("stopped")
+            raise
         except (OSError, websockets.exceptions.WebSocketException) as e:
-            print(f"connection lost: {e}; retrying in 1s", file=sys.stderr, flush=True)
+            on_status(f"connection lost: {e}; retrying in 1s")
             await asyncio.sleep(1.0)
 
 
-def parse_int_rect(s: str) -> tuple[int, int, int, int]:
-    parts = [int(p) for p in s.split(",")]
-    if len(parts) != 4:
-        raise argparse.ArgumentTypeError("expected x,y,w,h")
-    return tuple(parts)  # type: ignore[return-value]
+class StreamController:
+    """Owns the asyncio loop+thread for the streaming session."""
+
+    def __init__(self) -> None:
+        self.thread: threading.Thread | None = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.task: asyncio.Task | None = None
+
+    def is_running(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self, uri: str, get_region, fps: int, quality: int, on_status) -> None:
+        if self.is_running():
+            return
+        ready = threading.Event()
+
+        def thread_main() -> None:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.task = self.loop.create_task(
+                run_session(uri, get_region, fps, quality, on_status)
+            )
+            ready.set()
+            try:
+                self.loop.run_until_complete(self.task)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self.loop.close()
+
+        self.thread = threading.Thread(target=thread_main, daemon=True)
+        self.thread.start()
+        ready.wait(timeout=2.0)
+
+    def stop(self) -> None:
+        if self.loop and self.task and not self.task.done():
+            self.loop.call_soon_threadsafe(self.task.cancel)
+        if self.thread:
+            self.thread.join(timeout=3.0)
+        self.thread = None
+        self.loop = None
+        self.task = None
 
 
-def parse_float_rect(s: str) -> tuple[float, float, float, float]:
-    parts = [float(p) for p in s.split(",")]
-    if len(parts) != 4:
-        raise argparse.ArgumentTypeError("expected x,y,w,h")
-    return tuple(parts)  # type: ignore[return-value]
+class RegionPicker:
+    """Fullscreen drag-to-select rectangle picker. Returns (x, y, w, h) screen pixels."""
+
+    def __init__(self, parent: tk.Misc, on_done) -> None:
+        self.on_done = on_done
+        self.win = tk.Toplevel(parent)
+        self.win.attributes("-fullscreen", True)
+        self.win.attributes("-alpha", 0.3)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg="black", cursor="cross")
+        self.canvas = tk.Canvas(self.win, bg="black", highlightthickness=0, cursor="cross")
+        self.canvas.pack(fill="both", expand=True)
+        self.rect_id: int | None = None
+        self.start_screen: tuple[int, int] = (0, 0)
+        self.start_canvas: tuple[int, int] = (0, 0)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.win.bind("<Escape>", lambda e: self._cancel())
+
+    def _on_press(self, e: tk.Event) -> None:
+        self.start_screen = (e.x_root, e.y_root)
+        self.start_canvas = (e.x, e.y)
+        if self.rect_id is not None:
+            self.canvas.delete(self.rect_id)
+        self.rect_id = self.canvas.create_rectangle(
+            e.x, e.y, e.x, e.y, outline="#FF1493", width=2,
+        )
+
+    def _on_drag(self, e: tk.Event) -> None:
+        if self.rect_id is None:
+            return
+        sx, sy = self.start_canvas
+        self.canvas.coords(self.rect_id, sx, sy, e.x, e.y)
+
+    def _on_release(self, e: tk.Event) -> None:
+        sx, sy = self.start_screen
+        x1, y1 = min(sx, e.x_root), min(sy, e.y_root)
+        x2, y2 = max(sx, e.x_root), max(sy, e.y_root)
+        rect = (x1, y1, x2 - x1, y2 - y1)
+        self.win.destroy()
+        if rect[2] >= 8 and rect[3] >= 8:
+            self.on_done(rect)
+
+    def _cancel(self) -> None:
+        self.win.destroy()
+
+
+class SenderUI:
+    def __init__(self, root: tk.Tk, host: str, port: int, fps: int, quality: int) -> None:
+        self.root = root
+        self.fps = fps
+        self.quality = quality
+        self.region: tuple[int, int, int, int] | None = None
+        self.region_lock = threading.Lock()
+        self.controller = StreamController()
+
+        self.host_var = tk.StringVar(value=host)
+        self.port_var = tk.StringVar(value=str(port))
+        self.region_var = tk.StringVar(value="(none — streams cursor only)")
+        self.status_var = tk.StringVar(value="idle")
+        self.start_button_text = tk.StringVar(value="Start")
+
+        root.title("Akimbo sender")
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._build()
+
+    def _build(self) -> None:
+        frm = ttk.Frame(self.root, padding=10)
+        frm.grid(sticky="nsew")
+        ttk.Label(frm, text="Host IP:").grid(row=0, column=0, sticky="e", padx=4, pady=2)
+        ttk.Entry(frm, textvariable=self.host_var, width=22).grid(row=0, column=1, sticky="w")
+        ttk.Label(frm, text="Port:").grid(row=1, column=0, sticky="e", padx=4, pady=2)
+        ttk.Entry(frm, textvariable=self.port_var, width=8).grid(row=1, column=1, sticky="w")
+        ttk.Label(frm, text="Region:").grid(row=2, column=0, sticky="e", padx=4, pady=2)
+        ttk.Label(frm, textvariable=self.region_var).grid(row=2, column=1, sticky="w")
+        ttk.Button(frm, text="Select region…", command=self._select_region).grid(
+            row=3, column=0, columnspan=2, pady=(6, 2), sticky="ew"
+        )
+        ttk.Button(frm, textvariable=self.start_button_text, command=self._toggle_stream).grid(
+            row=4, column=0, columnspan=2, pady=(2, 6), sticky="ew"
+        )
+        ttk.Label(frm, textvariable=self.status_var, foreground="#555").grid(
+            row=5, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Label(
+            frm,
+            text="F2 held by default · backtick (`) toggles",
+            foreground="#888",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    def _get_region(self) -> tuple[int, int, int, int] | None:
+        with self.region_lock:
+            return self.region
+
+    def _set_region(self, rect: tuple[int, int, int, int]) -> None:
+        with self.region_lock:
+            self.region = rect
+        self.region_var.set(f"{rect[2]}×{rect[3]} at ({rect[0]}, {rect[1]})")
+
+    def _select_region(self) -> None:
+        self.root.withdraw()
+
+        def done(rect: tuple[int, int, int, int]) -> None:
+            self._set_region(rect)
+            self.root.deiconify()
+
+        # Restore the window even if the user hits Escape.
+        picker = RegionPicker(self.root, done)
+        picker.win.bind("<Destroy>", lambda e: self.root.deiconify(), add="+")
+
+    def _set_status(self, text: str) -> None:
+        # Called from background thread; route to Tk thread.
+        self.root.after(0, self.status_var.set, text)
+
+    def _toggle_stream(self) -> None:
+        if self.controller.is_running():
+            self.controller.stop()
+            self.start_button_text.set("Start")
+            self.status_var.set("stopped")
+            return
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            self.status_var.set("invalid port")
+            return
+        uri = f"ws://{self.host_var.get()}:{port}"
+        self.controller.start(uri, self._get_region, self.fps, self.quality, self._set_status)
+        self.start_button_text.set("Stop")
+
+    def _on_close(self) -> None:
+        self.controller.stop()
+        self.root.destroy()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Akimbo sender")
-    parser.add_argument("--host", default="127.0.0.1", help="host PC address")
+    parser.add_argument("--host", default="127.0.0.1", help="initial host PC address")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument(
-        "--src-rect", type=parse_int_rect, default=None,
-        help="sender pixel rect to capture, x,y,w,h (e.g. 0,0,800,450). Omit to disable streaming.",
-    )
-    parser.add_argument(
-        "--dest-rect", type=parse_float_rect, default=None,
-        help="host overlay destination rect, normalized 0..1, x,y,w,h (e.g. 0.7,0,0.3,0.17).",
-    )
     parser.add_argument("--capture-fps", type=int, default=20)
     parser.add_argument("--capture-quality", type=int, default=70)
     args = parser.parse_args()
 
-    if (args.src_rect is None) ^ (args.dest_rect is None):
-        parser.error("--src-rect and --dest-rect must be provided together")
-
-    uri = f"ws://{args.host}:{args.port}"
     atexit.register(release_f2)
     hold_f2()
+
+    root = tk.Tk()
+    SenderUI(root, args.host, args.port, args.capture_fps, args.capture_quality)
     try:
-        asyncio.run(run(
-            uri, args.src_rect, args.dest_rect,
-            args.capture_fps, args.capture_quality,
-        ))
+        root.mainloop()
     except KeyboardInterrupt:
         pass
     finally:

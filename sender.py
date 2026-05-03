@@ -23,13 +23,22 @@ user32.SetProcessDPIAware()
 
 VK_OEM_3 = 0xC0  # backtick / tilde key on US layouts
 VK_LBUTTON = 0x01
-SC_F2 = 0x3C
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 INPUT_KEYBOARD = 1
 IDC_ARROW = 32512
 DEFAULT_CURSOR_HANDLE = ctypes.windll.user32.LoadCursorW(0, IDC_ARROW)
-_f2_held = False
+
+# Function-key scancodes (set 1). F11/F12 are non-contiguous with the F1-F10 block.
+FUNCTION_KEY_SCANCODES = {
+    "F1": 0x3B, "F2": 0x3C, "F3": 0x3D, "F4": 0x3E,
+    "F5": 0x3F, "F6": 0x40, "F7": 0x41, "F8": 0x42,
+    "F9": 0x43, "F10": 0x44, "F11": 0x57, "F12": 0x58,
+}
+
+_held_key_name = "F2"
+_held_scancode = FUNCTION_KEY_SCANCODES["F2"]
+_key_held = False
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -77,29 +86,43 @@ def _send_scancode(scan: int, key_up: bool) -> None:
     user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
-def hold_f2() -> None:
-    global _f2_held
-    if _f2_held:
+def hold_key() -> None:
+    global _key_held
+    if _key_held:
         return
-    _send_scancode(SC_F2, key_up=False)
-    _f2_held = True
-    print("F2 held", file=sys.stderr, flush=True)
+    _send_scancode(_held_scancode, key_up=False)
+    _key_held = True
+    print(f"{_held_key_name} held", file=sys.stderr, flush=True)
 
 
-def release_f2() -> None:
-    global _f2_held
-    if not _f2_held:
+def release_key() -> None:
+    global _key_held
+    if not _key_held:
         return
-    _send_scancode(SC_F2, key_up=True)
-    _f2_held = False
-    print("F2 released", file=sys.stderr, flush=True)
+    _send_scancode(_held_scancode, key_up=True)
+    _key_held = False
+    print(f"{_held_key_name} released", file=sys.stderr, flush=True)
 
 
-def toggle_f2() -> None:
-    if _f2_held:
-        release_f2()
+def toggle_key() -> None:
+    if _key_held:
+        release_key()
     else:
-        hold_f2()
+        hold_key()
+
+
+def set_held_key(name: str) -> None:
+    """Switch which function key is being held. Re-holds the new key if the old one was held."""
+    global _held_key_name, _held_scancode
+    if name not in FUNCTION_KEY_SCANCODES or name == _held_key_name:
+        return
+    was_held = _key_held
+    if was_held:
+        release_key()
+    _held_key_name = name
+    _held_scancode = FUNCTION_KEY_SCANCODES[name]
+    if was_held:
+        hold_key()
 
 
 def is_key_down(vk: int) -> bool:
@@ -140,14 +163,14 @@ def get_screen_size() -> tuple[int, int]:
 def poll_toggle(prev_down: bool) -> bool:
     now_down = is_key_down(VK_OEM_3)
     if now_down and not prev_down:
-        toggle_f2()
+        toggle_key()
     return now_down
 
 
-# Refresh held F2 every Nth tick. At 120 Hz polling, every 4 ticks ≈ 30 Hz, which
-# matches typical OS auto-repeat for a physically held key. Required because games
-# like League can lose the synthetic held state when other keypresses arrive.
-F2_REFRESH_EVERY = 4
+# Refresh the held key every Nth tick. At 120 Hz polling, every 4 ticks ≈ 30 Hz,
+# which matches typical OS auto-repeat for a physically held key. Required because
+# games like League can lose the synthetic held state when other keypresses arrive.
+KEY_REFRESH_EVERY = 4
 
 
 async def cursor_loop(ws) -> None:
@@ -157,8 +180,8 @@ async def cursor_loop(ws) -> None:
     tick = 0
     while True:
         toggle_prev = poll_toggle(toggle_prev)
-        if _f2_held and tick % F2_REFRESH_EVERY == 0:
-            _send_scancode(SC_F2, key_up=False)
+        if _key_held and tick % KEY_REFRESH_EVERY == 0:
+            _send_scancode(_held_scancode, key_up=False)
         x, y = get_cursor_position()
         await ws.send(encode_position(
             x / width, y / height,
@@ -324,6 +347,7 @@ class SenderUI:
         self.region_var = tk.StringVar(value="(none — streams cursor only)")
         self.status_var = tk.StringVar(value="idle")
         self.start_button_text = tk.StringVar(value="Start")
+        self.held_key_var = tk.StringVar(value=_held_key_name)
 
         root.title("Akimbo sender")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -338,20 +362,33 @@ class SenderUI:
         ttk.Entry(frm, textvariable=self.port_var, width=8).grid(row=1, column=1, sticky="w")
         ttk.Label(frm, text="Region:").grid(row=2, column=0, sticky="e", padx=4, pady=2)
         ttk.Label(frm, textvariable=self.region_var).grid(row=2, column=1, sticky="w")
+        ttk.Label(frm, text="Held key:").grid(row=3, column=0, sticky="e", padx=4, pady=2)
+        held_key_combo = ttk.Combobox(
+            frm,
+            textvariable=self.held_key_var,
+            values=list(FUNCTION_KEY_SCANCODES.keys()),
+            state="readonly",
+            width=6,
+        )
+        held_key_combo.grid(row=3, column=1, sticky="w")
+        held_key_combo.bind("<<ComboboxSelected>>", self._on_held_key_change)
         ttk.Button(frm, text="Select region…", command=self._select_region).grid(
-            row=3, column=0, columnspan=2, pady=(6, 2), sticky="ew"
+            row=4, column=0, columnspan=2, pady=(6, 2), sticky="ew"
         )
         ttk.Button(frm, textvariable=self.start_button_text, command=self._toggle_stream).grid(
-            row=4, column=0, columnspan=2, pady=(2, 6), sticky="ew"
+            row=5, column=0, columnspan=2, pady=(2, 6), sticky="ew"
         )
         ttk.Label(frm, textvariable=self.status_var, foreground="#555").grid(
-            row=5, column=0, columnspan=2, sticky="w"
+            row=6, column=0, columnspan=2, sticky="w"
         )
         ttk.Label(
             frm,
-            text="F2 held by default · backtick (`) toggles",
+            text="held by default · backtick (`) toggles",
             foreground="#888",
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    def _on_held_key_change(self, _event=None) -> None:
+        set_held_key(self.held_key_var.get())
 
     def _get_region(self) -> tuple[int, int, int, int] | None:
         with self.region_lock:
@@ -405,8 +442,8 @@ def main() -> None:
     parser.add_argument("--capture-quality", type=int, default=70)
     args = parser.parse_args()
 
-    atexit.register(release_f2)
-    hold_f2()
+    atexit.register(release_key)
+    hold_key()
 
     root = tk.Tk()
     SenderUI(root, args.host, args.port, args.capture_fps, args.capture_quality)
@@ -415,7 +452,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        release_f2()
+        release_key()
 
 
 if __name__ == "__main__":

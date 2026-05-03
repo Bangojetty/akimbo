@@ -1,15 +1,14 @@
 import argparse
 import asyncio
 import ctypes
-import io
 import os
+import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import ttk
 
 import websockets
-from PIL import Image, ImageTk
+from PIL import Image
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from protocol import decode_image, decode_position
 
@@ -30,9 +29,6 @@ WS_EX_TOOLWINDOW = 0x00000080
 STALE_MS = 500
 TICK_MS = 8  # ~120 fps redraw cadence
 
-# Tk's transparentcolor on Windows treats this exact color as fully see-through.
-TRANSPARENT_KEY = "magenta"
-
 
 class State:
     def __init__(self) -> None:
@@ -44,7 +40,6 @@ class State:
         self.lmb = False
         self.image_jpeg: bytes | None = None
         self.image_seq = 0
-        # Host owns the position. Defaults to top-right corner area.
         self.pos_x_norm = 0.7
         self.pos_y_norm = 0.0
 
@@ -119,175 +114,168 @@ def set_clickthrough(hwnd: int, enable: bool) -> None:
     user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
 
-def load_cursor(filename: str, size_px: int) -> ImageTk.PhotoImage:
+def load_cursor_pixmap(filename: str, size_px: int) -> QtGui.QPixmap:
     path = os.path.join(CURSORS_DIR, filename)
-    img = Image.open(path).convert("RGBA")
-    img = img.resize((size_px, size_px), Image.LANCZOS)
-    # Tk's -transparentcolor only matches the exact magenta key, so anti-aliased
-    # edges would blend to a pinkish color and remain opaque (halo). Threshold
-    # alpha to binary and composite onto magenta so only fully transparent
-    # pixels are keyed out.
-    r, g, b, a = img.split()
-    mask = a.point(lambda v: 255 if v >= 128 else 0)
-    bg = Image.new("RGB", img.size, (255, 0, 255))
-    bg.paste(Image.merge("RGB", (r, g, b)), (0, 0), mask)
-    return ImageTk.PhotoImage(bg)
+    img = Image.open(path).convert("RGBA").resize((size_px, size_px), Image.LANCZOS)
+    data = img.tobytes("raw", "RGBA")
+    qimg = QtGui.QImage(
+        data, img.width, img.height, img.width * 4,
+        QtGui.QImage.Format.Format_RGBA8888,
+    ).copy()  # copy so the pixmap doesn't reference the soon-freed bytes buffer
+    return QtGui.QPixmap.fromImage(qimg)
 
 
-def run_overlay() -> None:
-    width = user32.GetSystemMetrics(0)
-    height = user32.GetSystemMetrics(1)
+class Overlay(QtWidgets.QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.Tool
+        )
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        # Don't steal focus from the game when the overlay shows up.
+        self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
 
-    root = tk.Tk()
-    root.overrideredirect(True)
-    root.geometry(f"{width}x{height}+0+0")
-    root.attributes("-topmost", True)
-    root.configure(bg=TRANSPARENT_KEY)
-    root.attributes("-transparentcolor", TRANSPARENT_KEY)
+        screen = QtWidgets.QApplication.primaryScreen().geometry()
+        self.screen_w = screen.width()
+        self.screen_h = screen.height()
+        self.setGeometry(0, 0, self.screen_w, self.screen_h)
 
-    canvas = tk.Canvas(
-        root, width=width, height=height,
-        bg=TRANSPARENT_KEY, highlightthickness=0,
-    )
-    canvas.pack(fill="both", expand=True)
+        self.cursor_pixmaps = {
+            "default": load_cursor_pixmap("Blue.cur", CURSOR_BASE_PX),
+            "hover": load_cursor_pixmap("Red.cur", int(CURSOR_BASE_PX * CURSOR_HOVER_SCALE)),
+            "click": load_cursor_pixmap("Orange.cur", int(CURSOR_BASE_PX * CURSOR_CLICK_SCALE)),
+        }
+        self.cursor_key: str | None = None
+        self.cursor_x = 0
+        self.cursor_y = 0
 
-    # Image item below the cursor so the cursor stays visible over the stream.
-    image_item = canvas.create_image(0, 0, anchor="nw", state="hidden")
+        self.image_pixmap: QtGui.QPixmap | None = None
+        self.image_seq = -1
 
-    cursor_images = {
-        "default": load_cursor("Blue.cur", CURSOR_BASE_PX),
-        "hover": load_cursor("Red.cur", int(CURSOR_BASE_PX * CURSOR_HOVER_SCALE)),
-        "click": load_cursor("Orange.cur", int(CURSOR_BASE_PX * CURSOR_CLICK_SCALE)),
-    }
-    cursor_item = canvas.create_image(
-        0, 0, image=cursor_images["default"], state="hidden",
-    )
+        self.repos_active = False
+        self.drag_offset: tuple[int, int] | None = None
 
-    # Outline shown only during reposition mode.
-    reposition_outline = canvas.create_rectangle(
-        0, 0, 0, 0, outline="#FF1493", width=2, dash=(6, 4), state="hidden",
-    )
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(TICK_MS)
 
-    # Click-through must be applied after the HWND exists. Tk wraps its toplevel
-    # in an internal parent on Windows, so the actual styled window is GetParent.
-    root.update_idletasks()
-    hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
-    set_clickthrough(hwnd, enable=True)
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        set_clickthrough(int(self.winId()), enable=True)
 
-    image_state = {
-        "seq": -1,
-        "photo": None,
-        "size": (0, 0),  # native size of last received frame
-    }
-    repos = {"active": False, "drag_offset": (0, 0)}
-
-    def update_image_position() -> None:
-        x_norm, y_norm = STATE.get_position()
-        dx = int(x_norm * width)
-        dy = int(y_norm * height)
-        canvas.coords(image_item, dx, dy)
-        w, h = image_state["size"]
-        if w > 0 and h > 0:
-            canvas.coords(reposition_outline, dx, dy, dx + w, dy + h)
-
-    def render_image() -> None:
-        jpeg, seq = STATE.snapshot_image()
-        if jpeg is None or seq == image_state["seq"]:
-            return
-        image_state["seq"] = seq
-        try:
-            pil = Image.open(io.BytesIO(jpeg))
-            photo = ImageTk.PhotoImage(pil)
-            image_state["photo"] = photo  # Tk does not retain the reference
-            image_state["size"] = pil.size
-            canvas.itemconfigure(image_item, image=photo, state="normal")
-            canvas.tag_lower(image_item)  # keep cursor on top
-            update_image_position()
-        except Exception as e:
-            print(f"image render error: {e}", flush=True)
-
-    def on_drag_press(e: tk.Event) -> None:
-        if not repos["active"]:
-            return
-        cx, cy = canvas.coords(image_item)
-        repos["drag_offset"] = (e.x - cx, e.y - cy)
-
-    def on_drag_motion(e: tk.Event) -> None:
-        if not repos["active"]:
-            return
-        ox, oy = repos["drag_offset"]
-        new_x = max(0, e.x - ox)
-        new_y = max(0, e.y - oy)
-        STATE.set_position(new_x / width, new_y / height)
-        update_image_position()
-
-    canvas.tag_bind(image_item, "<ButtonPress-1>", on_drag_press)
-    canvas.tag_bind(image_item, "<B1-Motion>", on_drag_motion)
-
-    def enter_reposition() -> None:
-        repos["active"] = True
-        set_clickthrough(hwnd, enable=False)
-        canvas.itemconfigure(reposition_outline, state="normal")
-        update_image_position()
-
-    def exit_reposition() -> None:
-        repos["active"] = False
-        set_clickthrough(hwnd, enable=True)
-        canvas.itemconfigure(reposition_outline, state="hidden")
-
-    def tick() -> None:
+    def _tick(self) -> None:
         x_norm, y_norm, last, default_cursor, lmb = STATE.snapshot()
         now = int(time.time() * 1000)
         if last == 0 or now - last > STALE_MS:
-            canvas.itemconfigure(cursor_item, state="hidden")
+            self.cursor_key = None
         else:
-            # Click takes precedence over hover state.
             if lmb:
-                key = "click"
+                self.cursor_key = "click"
             elif not default_cursor:
-                key = "hover"
+                self.cursor_key = "hover"
             else:
-                key = "default"
-            cx = int(x_norm * width)
-            cy = int(y_norm * height)
-            canvas.coords(cursor_item, cx, cy)
-            canvas.itemconfigure(cursor_item, image=cursor_images[key], state="normal")
-            canvas.tag_raise(cursor_item)
-        render_image()
-        root.after(TICK_MS, tick)
+                self.cursor_key = "default"
+            self.cursor_x = int(x_norm * self.screen_w)
+            self.cursor_y = int(y_norm * self.screen_h)
 
-    tick()
-    build_control_window(root, enter_reposition, exit_reposition)
-    root.mainloop()
+        jpeg, seq = STATE.snapshot_image()
+        if jpeg is not None and seq != self.image_seq:
+            self.image_seq = seq
+            pix = QtGui.QPixmap()
+            if pix.loadFromData(jpeg, "JPEG"):
+                self.image_pixmap = pix
+
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+
+        if self.image_pixmap is not None:
+            ix_norm, iy_norm = STATE.get_position()
+            ix = int(ix_norm * self.screen_w)
+            iy = int(iy_norm * self.screen_h)
+            p.drawPixmap(ix, iy, self.image_pixmap)
+            if self.repos_active:
+                pen = QtGui.QPen(QtGui.QColor("#FF1493"), 2, QtCore.Qt.DashLine)
+                p.setPen(pen)
+                p.setBrush(QtCore.Qt.NoBrush)
+                p.drawRect(ix, iy, self.image_pixmap.width(), self.image_pixmap.height())
+
+        if self.cursor_key is not None:
+            p.drawPixmap(self.cursor_x, self.cursor_y, self.cursor_pixmaps[self.cursor_key])
+
+    def enter_reposition(self) -> None:
+        self.repos_active = True
+        set_clickthrough(int(self.winId()), enable=False)
+
+    def exit_reposition(self) -> None:
+        self.repos_active = False
+        self.drag_offset = None
+        set_clickthrough(int(self.winId()), enable=True)
+
+    def _image_rect(self) -> QtCore.QRect | None:
+        if self.image_pixmap is None:
+            return None
+        ix_norm, iy_norm = STATE.get_position()
+        ix = int(ix_norm * self.screen_w)
+        iy = int(iy_norm * self.screen_h)
+        return QtCore.QRect(ix, iy, self.image_pixmap.width(), self.image_pixmap.height())
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if not self.repos_active or event.button() != QtCore.Qt.LeftButton:
+            return
+        rect = self._image_rect()
+        if rect is None or not rect.contains(event.pos()):
+            return
+        self.drag_offset = (event.pos().x() - rect.x(), event.pos().y() - rect.y())
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if not self.repos_active or self.drag_offset is None:
+            return
+        ox, oy = self.drag_offset
+        new_x = max(0, event.pos().x() - ox)
+        new_y = max(0, event.pos().y() - oy)
+        STATE.set_position(new_x / self.screen_w, new_y / self.screen_h)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        self.drag_offset = None
 
 
-def build_control_window(parent: tk.Tk, enter_repos, exit_repos) -> tk.Toplevel:
-    win = tk.Toplevel(parent)
-    win.title("Akimbo host")
-    win.attributes("-topmost", True)
-    win.resizable(False, False)
-    state = {"active": False}
-    btn_text = tk.StringVar(value="Reposition stream")
-    status = tk.StringVar(value="ready")
+class ControlWindow(QtWidgets.QWidget):
+    def __init__(self, overlay: Overlay) -> None:
+        super().__init__()
+        self.overlay = overlay
+        self.setWindowTitle("Akimbo host")
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self.setFixedSize(240, 90)
+        self.active = False
 
-    def toggle() -> None:
-        state["active"] = not state["active"]
-        if state["active"]:
-            enter_repos()
-            btn_text.set("Done")
-            status.set("drag the stream to a new spot")
+        self.btn = QtWidgets.QPushButton("Reposition stream")
+        self.btn.clicked.connect(self._toggle)
+        self.status = QtWidgets.QLabel("ready")
+        self.status.setStyleSheet("color: #666;")
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.btn)
+        layout.addWidget(self.status)
+
+    def _toggle(self) -> None:
+        self.active = not self.active
+        if self.active:
+            self.overlay.enter_reposition()
+            self.btn.setText("Done")
+            self.status.setText("drag the stream to a new spot")
         else:
-            exit_repos()
-            btn_text.set("Reposition stream")
-            status.set("locked")
+            self.overlay.exit_reposition()
+            self.btn.setText("Reposition stream")
+            self.status.setText("locked")
 
-    frm = ttk.Frame(win, padding=10)
-    frm.grid()
-    ttk.Button(frm, textvariable=btn_text, command=toggle, width=22).grid(row=0, column=0)
-    ttk.Label(frm, textvariable=status, foreground="#666").grid(
-        row=1, column=0, pady=(6, 0), sticky="w"
-    )
-    return win
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        QtWidgets.QApplication.instance().quit()
+        super().closeEvent(event)
 
 
 def main() -> None:
@@ -298,7 +286,12 @@ def main() -> None:
     threading.Thread(target=run_server, args=(args.port,), daemon=True).start()
     print(f"listening on ws://0.0.0.0:{args.port}", flush=True)
 
-    run_overlay()
+    app = QtWidgets.QApplication(sys.argv)
+    overlay = Overlay()
+    overlay.show()
+    control = ControlWindow(overlay)
+    control.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

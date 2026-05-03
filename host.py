@@ -2,12 +2,12 @@ import argparse
 import asyncio
 import ctypes
 import os
+import struct
 import sys
 import threading
 import time
 
 import websockets
-from PIL import Image
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from protocol import decode_image, decode_position
@@ -114,14 +114,83 @@ def set_clickthrough(hwnd: int, enable: bool) -> None:
     user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
 
+def _decode_cur(data: bytes, target_size: int) -> QtGui.QImage:
+    # PIL's CUR plugin drops the 32bpp alpha channel and returns RGB, which
+    # gives a black box around the cursor. Parse the file directly so we keep
+    # both the embedded BGRA pixels (32bpp) and the AND mask (24bpp fallback).
+    _, type_, count = struct.unpack_from("<HHH", data, 0)
+    if type_ != 2:
+        raise ValueError("not a CUR file")
+
+    # Pick the entry whose width is closest to target_size, preferring entries
+    # that are >= target_size so we only ever downscale.
+    best = None
+    best_score = None
+    for i in range(count):
+        eoff = 6 + i * 16
+        w_b = data[eoff]
+        ioff = struct.unpack_from("<I", data, eoff + 12)[0]
+        w = 256 if w_b == 0 else w_b
+        score = (0, w - target_size) if w >= target_size else (1, target_size - w)
+        if best_score is None or score < best_score:
+            best_score = score
+            best = (w, ioff)
+
+    _, ioff = best
+    bi_size, bi_w, bi_h, _, bi_bpp, _ = struct.unpack_from("<IiiHHI", data, ioff)
+    img_h = bi_h // 2  # BMPs in CUR store XOR pixels + AND mask stacked
+    pixel_off = ioff + bi_size
+
+    if bi_bpp == 32:
+        row_bytes = bi_w * 4
+        # BMP is bottom-up; flip rows. Bytes are already BGRA so Format_BGRA8888
+        # avoids an explicit byte swap.
+        rows = [
+            data[pixel_off + (img_h - 1 - y) * row_bytes : pixel_off + (img_h - y) * row_bytes]
+            for y in range(img_h)
+        ]
+        pixels = b"".join(rows)
+        return QtGui.QImage(
+            pixels, bi_w, img_h, row_bytes, QtGui.QImage.Format.Format_ARGB32,
+        ).copy()
+
+    if bi_bpp == 24:
+        xor_row_bytes = ((bi_w * 24 + 31) // 32) * 4
+        and_row_bytes = ((bi_w + 31) // 32) * 4
+        and_off = pixel_off + xor_row_bytes * img_h
+        out = bytearray(bi_w * img_h * 4)
+        for y in range(img_h):
+            src_y = img_h - 1 - y
+            xor_row = pixel_off + src_y * xor_row_bytes
+            and_row = and_off + src_y * and_row_bytes
+            for x in range(bi_w):
+                b = data[xor_row + x * 3]
+                g = data[xor_row + x * 3 + 1]
+                r = data[xor_row + x * 3 + 2]
+                bit = (data[and_row + x // 8] >> (7 - (x % 8))) & 1
+                o = (y * bi_w + x) * 4
+                out[o] = b
+                out[o + 1] = g
+                out[o + 2] = r
+                out[o + 3] = 0 if bit else 255
+        return QtGui.QImage(
+            bytes(out), bi_w, img_h, bi_w * 4, QtGui.QImage.Format.Format_ARGB32,
+        ).copy()
+
+    raise NotImplementedError(f"CUR bpp={bi_bpp} not supported")
+
+
 def load_cursor_pixmap(filename: str, size_px: int) -> QtGui.QPixmap:
     path = os.path.join(CURSORS_DIR, filename)
-    img = Image.open(path).convert("RGBA").resize((size_px, size_px), Image.LANCZOS)
-    data = img.tobytes("raw", "RGBA")
-    qimg = QtGui.QImage(
-        data, img.width, img.height, img.width * 4,
-        QtGui.QImage.Format.Format_RGBA8888,
-    ).copy()  # copy so the pixmap doesn't reference the soon-freed bytes buffer
+    with open(path, "rb") as f:
+        data = f.read()
+    qimg = _decode_cur(data, size_px)
+    if qimg.width() != size_px or qimg.height() != size_px:
+        qimg = qimg.scaled(
+            size_px, size_px,
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
     return QtGui.QPixmap.fromImage(qimg)
 
 

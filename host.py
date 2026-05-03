@@ -123,7 +123,15 @@ def load_cursor(filename: str, size_px: int) -> ImageTk.PhotoImage:
     path = os.path.join(CURSORS_DIR, filename)
     img = Image.open(path).convert("RGBA")
     img = img.resize((size_px, size_px), Image.LANCZOS)
-    return ImageTk.PhotoImage(img)
+    # Tk's -transparentcolor only matches the exact magenta key, so anti-aliased
+    # edges would blend to a pinkish color and remain opaque (halo). Threshold
+    # alpha to binary and composite onto magenta so only fully transparent
+    # pixels are keyed out.
+    r, g, b, a = img.split()
+    mask = a.point(lambda v: 255 if v >= 128 else 0)
+    bg = Image.new("RGB", img.size, (255, 0, 255))
+    bg.paste(Image.merge("RGB", (r, g, b)), (0, 0), mask)
+    return ImageTk.PhotoImage(bg)
 
 
 def run_overlay() -> None:

@@ -22,7 +22,7 @@ user32 = ctypes.windll.user32
 user32.SetProcessDPIAware()
 
 VK_OEM_3 = 0xC0  # backtick / tilde key on US layouts
-VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 INPUT_KEYBOARD = 1
@@ -186,7 +186,7 @@ async def cursor_loop(ws) -> None:
         await ws.send(encode_position(
             x / width, y / height,
             is_default_cursor(),
-            is_key_down(VK_LBUTTON),
+            is_key_down(VK_RBUTTON),
         ))
         await asyncio.sleep(interval)
         tick += 1

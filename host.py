@@ -37,23 +37,23 @@ class State:
         self.y = 0.0
         self.last_update_ms = 0
         self.default_cursor = True
-        self.lmb = False
+        self.rmb = False
         self.image_jpeg: bytes | None = None
         self.image_seq = 0
         self.pos_x_norm = 0.7
         self.pos_y_norm = 0.0
 
-    def update(self, x: float, y: float, default_cursor: bool, lmb: bool) -> None:
+    def update(self, x: float, y: float, default_cursor: bool, rmb: bool) -> None:
         with self.lock:
             self.x = x
             self.y = y
             self.default_cursor = default_cursor
-            self.lmb = lmb
+            self.rmb = rmb
             self.last_update_ms = int(time.time() * 1000)
 
     def snapshot(self) -> tuple[float, float, int, bool, bool]:
         with self.lock:
-            return self.x, self.y, self.last_update_ms, self.default_cursor, self.lmb
+            return self.x, self.y, self.last_update_ms, self.default_cursor, self.rmb
 
     def update_image(self, jpeg: bytes) -> None:
         with self.lock:
@@ -83,10 +83,10 @@ async def handle_sender(ws) -> None:
         async for msg in ws:
             if isinstance(msg, str):
                 try:
-                    x, y, _, default_cursor, lmb = decode_position(msg)
+                    x, y, _, default_cursor, rmb = decode_position(msg)
                 except Exception:
                     continue
-                STATE.update(x, y, default_cursor, lmb)
+                STATE.update(x, y, default_cursor, rmb)
             else:
                 try:
                     jpeg = decode_image(msg)
@@ -235,12 +235,12 @@ class Overlay(QtWidgets.QWidget):
         set_clickthrough(int(self.winId()), enable=True)
 
     def _tick(self) -> None:
-        x_norm, y_norm, last, default_cursor, lmb = STATE.snapshot()
+        x_norm, y_norm, last, default_cursor, rmb = STATE.snapshot()
         now = int(time.time() * 1000)
         if last == 0 or now - last > STALE_MS:
             self.cursor_key = None
         else:
-            if lmb:
+            if rmb:
                 self.cursor_key = "click"
             elif not default_cursor:
                 self.cursor_key = "hover"
@@ -274,7 +274,14 @@ class Overlay(QtWidgets.QWidget):
                 p.drawRect(ix, iy, self.image_pixmap.width(), self.image_pixmap.height())
 
         if self.cursor_key is not None:
-            p.drawPixmap(self.cursor_x, self.cursor_y, self.cursor_pixmaps[self.cursor_key])
+            pix = self.cursor_pixmaps[self.cursor_key]
+            # Center the pixmap on the reported cursor position so scaling
+            # (hover/click states) doesn't shift the visual anchor.
+            p.drawPixmap(
+                self.cursor_x - pix.width() // 2,
+                self.cursor_y - pix.height() // 2,
+                pix,
+            )
 
     def enter_reposition(self) -> None:
         self.repos_active = True

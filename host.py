@@ -214,7 +214,7 @@ class Overlay(QtWidgets.QWidget):
         self.cursor_pixmaps = {
             "default": load_cursor_pixmap("Blue.cur", CURSOR_BASE_PX),
             "hover": load_cursor_pixmap("Red.cur", int(CURSOR_BASE_PX * CURSOR_HOVER_SCALE)),
-            "click": load_cursor_pixmap("Orange.cur", int(CURSOR_BASE_PX * CURSOR_CLICK_SCALE)),
+            "click": load_cursor_pixmap("DarkBlue.cur", int(CURSOR_BASE_PX * CURSOR_CLICK_SCALE)),
         }
         self.cursor_key: str | None = None
         self.cursor_x = 0

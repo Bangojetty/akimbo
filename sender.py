@@ -28,6 +28,7 @@ KEYEVENTF_SCANCODE = 0x0008
 INPUT_KEYBOARD = 1
 IDC_ARROW = 32512
 DEFAULT_CURSOR_HANDLE = ctypes.windll.user32.LoadCursorW(0, IDC_ARROW)
+CURSOR_SHOWING = 0x00000001
 
 # Function-key scancodes (set 1). F11/F12 are non-contiguous with the F1-F10 block.
 FUNCTION_KEY_SCANCODES = {
@@ -152,6 +153,11 @@ def is_default_cursor() -> bool:
     info = CURSORINFO()
     info.cbSize = ctypes.sizeof(info)
     if not user32.GetCursorInfo(ctypes.byref(info)):
+        return True
+    # Windows suppresses the cursor during idle / touch interaction. The hCursor
+    # reported in that state is not the arrow handle, which would falsely trigger
+    # the hover state. Treat hidden/suppressed as default.
+    if not (info.flags & CURSOR_SHOWING):
         return True
     return info.hCursor == DEFAULT_CURSOR_HANDLE
 

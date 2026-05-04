@@ -3,6 +3,8 @@ import asyncio
 import atexit
 import ctypes
 import io
+import json
+import os
 import os.path
 import sys
 import threading
@@ -15,6 +17,26 @@ import websockets
 from PIL import Image
 
 from protocol import encode_image, encode_position
+
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "akimbo_config.json"
+)
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError as e:
+        print(f"failed to save config: {e}", file=sys.stderr, flush=True)
 
 POLL_HZ = 120
 
@@ -395,7 +417,8 @@ class RegionPicker:
 
 
 class SenderUI:
-    def __init__(self, root: tk.Tk, host: str, port: int, fps: int, quality: int) -> None:
+    def __init__(self, root: tk.Tk, host: str, port: int, fps: int, quality: int,
+                 config: dict) -> None:
         self.root = root
         self.fps = fps
         self.quality = quality
@@ -403,16 +426,30 @@ class SenderUI:
         self.region_lock = threading.Lock()
         self.controller = StreamController()
 
-        self.host_var = tk.StringVar(value=host)
-        self.port_var = tk.StringVar(value=str(port))
+        # Config (last saved settings) wins over CLI defaults so re-opening
+        # the app reproduces the previous session.
+        cfg_host = config.get("host", host)
+        cfg_port = int(config.get("port", port))
+        cfg_held_key = config.get("held_key", _held_key_name)
+        cfg_region = config.get("region")
+
+        self.host_var = tk.StringVar(value=cfg_host)
+        self.port_var = tk.StringVar(value=str(cfg_port))
         self.region_var = tk.StringVar(value="(none — streams cursor only)")
         self.status_var = tk.StringVar(value="idle")
         self.start_button_text = tk.StringVar(value="Start")
-        self.held_key_var = tk.StringVar(value=_held_key_name)
+        self.held_key_var = tk.StringVar(value=cfg_held_key)
+
+        if cfg_held_key in FUNCTION_KEY_SCANCODES and cfg_held_key != _held_key_name:
+            set_held_key(cfg_held_key)
+        if cfg_region and len(cfg_region) == 4:
+            self._apply_region(tuple(cfg_region))
 
         root.title("Akimbo sender")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build()
+        # Auto-start streaming after the UI has settled.
+        self.root.after(100, self._toggle_stream)
 
     def _build(self) -> None:
         frm = ttk.Frame(self.root, padding=10)
@@ -450,15 +487,32 @@ class SenderUI:
 
     def _on_held_key_change(self, _event=None) -> None:
         set_held_key(self.held_key_var.get())
+        self._save()
 
     def _get_region(self) -> tuple[int, int, int, int] | None:
         with self.region_lock:
             return self.region
 
-    def _set_region(self, rect: tuple[int, int, int, int]) -> None:
+    def _apply_region(self, rect: tuple[int, int, int, int]) -> None:
         with self.region_lock:
             self.region = rect
         self.region_var.set(f"{rect[2]}×{rect[3]} at ({rect[0]}, {rect[1]})")
+
+    def _set_region(self, rect: tuple[int, int, int, int]) -> None:
+        self._apply_region(rect)
+        self._save()
+
+    def _save(self) -> None:
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            port = 8765
+        save_config({
+            "host": self.host_var.get(),
+            "port": port,
+            "region": list(self.region) if self.region else None,
+            "held_key": self.held_key_var.get(),
+        })
 
     def _select_region(self) -> None:
         self.root.withdraw()
@@ -489,6 +543,7 @@ class SenderUI:
         uri = f"ws://{self.host_var.get()}:{port}"
         self.controller.start(uri, self._get_region, self.fps, self.quality, self._set_status)
         self.start_button_text.set("Stop")
+        self._save()
 
     def _on_close(self) -> None:
         self.controller.stop()
@@ -506,8 +561,9 @@ def main() -> None:
     atexit.register(release_key)
     hold_key()
 
+    config = load_config()
     root = tk.Tk()
-    SenderUI(root, args.host, args.port, args.capture_fps, args.capture_quality)
+    SenderUI(root, args.host, args.port, args.capture_fps, args.capture_quality, config)
     try:
         root.mainloop()
     except KeyboardInterrupt:

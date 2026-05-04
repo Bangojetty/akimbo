@@ -3,6 +3,7 @@ import asyncio
 import atexit
 import ctypes
 import io
+import os.path
 import sys
 import threading
 import tkinter as tk
@@ -29,6 +30,21 @@ INPUT_KEYBOARD = 1
 IDC_ARROW = 32512
 DEFAULT_CURSOR_HANDLE = ctypes.windll.user32.LoadCursorW(0, IDC_ARROW)
 CURSOR_SHOWING = 0x00000001
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+# Apps whose custom cursors should still be reported as "default" (no hover-state
+# swap on the host) — typically games we know use their own cursor system-wide.
+ALWAYS_DEFAULT_EXES = {"league of legends.exe", "leagueclient.exe"}
+
+kernel32 = ctypes.windll.kernel32
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
 
 # Function-key scancodes (set 1). F11/F12 are non-contiguous with the F1-F10 block.
 FUNCTION_KEY_SCANCODES = {
@@ -149,7 +165,46 @@ def get_cursor_position() -> tuple[int, int]:
     return pt.x, pt.y
 
 
+_foreground_cache = {"hwnd": 0, "always_default": False}
+
+
+def _foreground_exe_name() -> str:
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return ""
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return ""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(len(buf))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buf.value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def foreground_is_always_default() -> bool:
+    """True if the foreground process is in the always-default whitelist (e.g. League)."""
+    hwnd = user32.GetForegroundWindow()
+    if hwnd != _foreground_cache["hwnd"]:
+        _foreground_cache["hwnd"] = hwnd
+        _foreground_cache["always_default"] = (
+            _foreground_exe_name().lower() in ALWAYS_DEFAULT_EXES
+        )
+    return _foreground_cache["always_default"]
+
+
 def is_default_cursor() -> bool:
+    # Games like League use their own cursor system-wide, which would otherwise
+    # constantly trigger the hover state. Force default while focused.
+    if foreground_is_always_default():
+        return True
     info = CURSORINFO()
     info.cbSize = ctypes.sizeof(info)
     if not user32.GetCursorInfo(ctypes.byref(info)):
